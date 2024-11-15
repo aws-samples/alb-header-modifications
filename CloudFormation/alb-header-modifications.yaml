@@ -1,0 +1,198 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: AWS CloudFormation template to deploy AWS Lambda function that modifies ALB listener attributes based for headers
+
+Parameters:
+  ALBAttributeName:
+    Description: Name of the ALB listener attribute to modify
+    Type: String
+
+  ALBAttributeValue:
+    Description: Value of the ALB listener attribute to set
+    Type: String
+
+  TagKey:
+    Description: Name of ALB Tag Key
+    Type: String
+
+  TagValue:
+    Description: Name of ALB Tag Value
+    Type: String
+
+Resources:
+
+  # IAM Role for Lambda
+  ALBHeadersLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "LambdaCloudWatchLogsPermissions"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !GetAtt LambdaLogGroupForAlbHeaders.Arn
+        - PolicyName: "LambdaELBPermissions"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "elasticloadbalancing:DescribeLoadBalancerAttributes"
+                  - "elasticloadbalancing:ModifyLoadBalancerAttributes"
+                  - "elasticloadbalancing:SetSubnets"
+                  - "elasticloadbalancing:DescribeLoadBalancers"
+                  - "elasticloadbalancing:DescribeListeners"
+                  - "elasticloadbalancing:ModifyListener"
+                  - "elasticloadbalancing:DescribeTags"
+                  - "elasticloadbalancing:ModifyListenerAttributes"
+                Resource: "*"
+
+  LambdaLogGroupForAlbHeaders:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  # Lambda Function
+  ALBHeaderChangeFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroupForAlbHeaders
+    Properties:
+      Description: An AWS Lambda function to modify ALB Headers based on tags provided.
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroupForAlbHeaders
+      Handler: index.lambda_handler
+      Role: !GetAtt ALBHeadersLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+            import sys
+            import subprocess
+            import importlib
+            import json
+            import os
+            
+            def get_albs_with_tag(elb_client, tag_key, tag_value):
+                try:
+                    albs_with_tag = []
+                    load_balancers = elb_client.describe_load_balancers()['LoadBalancers']
+                    
+                    for lb in load_balancers:
+                        lb_arn = lb['LoadBalancerArn']
+                        tags = elb_client.describe_tags(ResourceArns=[lb_arn])['TagDescriptions'][0]['Tags']
+                        
+                        for tag in tags:
+                            if tag['Key'] == tag_key and tag['Value'] == tag_value:
+                                albs_with_tag.append(lb_arn)
+                                break
+                    
+                    print(f"Found ALBs with tag {tag_key}={tag_value}: {albs_with_tag}")
+                    return albs_with_tag
+                except Exception as e:
+                    print(f"Error retrieving ALBs with tag {tag_key}={tag_value}. Error: {str(e)}")
+                    return []
+                    
+            def modify_alb_listener_attribute(elb_client, listener_arn, attribute_name, attribute_value):
+                try:
+                    response = elb_client.modify_listener_attributes(
+                                    ListenerArn=listener_arn,
+                                    Attributes=[
+                                        {
+                                            'Key': attribute_name,
+                                            'Value': attribute_value
+                                        },
+                                    ]
+                                )
+                    return response
+                except Exception as e:
+                    print(f"Failed to modify listener: {listener_arn}. Error: {str(e)}")
+                    return None
+            
+            
+            def lambda_handler(event, context):
+                try:
+                    # Import latest boto3
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "boto3", "-t", "/tmp"])
+                    sys.path.insert(0, "/tmp")
+                    import boto3
+                except ImportError:
+                    print(f"Failed to import latest boto3")
+                    import boto3
+                    
+                elb_client = boto3.client('elbv2')  
+                
+                attribute_key = os.environ.get('ALB_ATTRIBUTE_NAME')  
+                attribute_value = os.environ.get('ALB_ATTRIBUTE_VALUE')  
+
+                if not attribute_key or not attribute_value:
+                    return {
+                        'statusCode': 400,
+                        'body': 'Missing ALB_ATTRIBUTE_NAME or ALB_ATTRIBUTE_VALUE  in environment variables.'
+                    }
+                
+                tag_key = event.get('tag_key') or os.environ.get('TAG_KEY')
+                tag_value = event.get('tag_value') or os.environ.get('TAG_VALUE')
+                
+                if not tag_key or not tag_value:
+                    return {
+                        'statusCode': 400,
+                        'body': 'Missing TAG_KEY or TAG_VALUE in the event or environment variables.'
+                    }
+                
+                # Get all ALBs with the specific tag
+                albs_with_tag = get_albs_with_tag(elb_client, tag_key, tag_value)
+                
+                if not albs_with_tag:
+                    return {
+                        'statusCode': 200,
+                        'body': f"No ALBs found with tag {tag_key}={tag_value}."
+                    }
+                
+                # Iterate over ALBs and process them
+                for alb_arn in albs_with_tag:
+                    # Fetch listeners and modify the listener attributes
+                    listeners = elb_client.describe_listeners(LoadBalancerArn=alb_arn)['Listeners']
+                    for listener in listeners:
+                        listener_arn = listener['ListenerArn']
+                        modify_alb_listener_attribute(elb_client, listener_arn, attribute_key, attribute_value)
+                
+                return {
+                    'statusCode': 200,
+                    'body': f"Processed {len(albs_with_tag)} ALBs with tag {tag_key}={tag_value}."
+                }
+      Runtime: python3.9
+      Timeout: 600 # Timeout value in seconds
+      MemorySize: 128 # Memory size in MB
+      RuntimeManagementConfig:
+        UpdateRuntimeOn: Auto
+      Environment:
+        Variables:
+          ALB_ATTRIBUTE_NAME: !Ref ALBAttributeName
+          ALB_ATTRIBUTE_VALUE: !Ref ALBAttributeValue
+          TAG_KEY: !Ref TagKey
+          TAG_VALUE: !Ref TagValue
+
+  # # Lambda Function Execution Permissions
+  # LambdaInvokePermissions:
+  #   Type: AWS::Lambda::Permission
+  #   Properties:
+  #     FunctionName: !GetAtt ALBHeaderChangeFunction.Arn
+  #     Action: lambda:InvokeFunction
+  #     Principal: elasticloadbalancing.amazonaws.com
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt ALBHeaderChangeFunction.Arn
